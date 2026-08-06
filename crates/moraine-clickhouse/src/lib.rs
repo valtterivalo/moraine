@@ -2346,6 +2346,81 @@ mod tests {
     }
 
     #[test]
+    fn migration_031_bounds_heavy_backfill_memory_like_033() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "031")
+            .expect("migration 031 must be registered");
+        let sql = materialize_migration_sql(migration.sql, "other_db")
+            .expect("materialize migration 031");
+        let statements = split_sql_statements(&sql);
+        let locator_backfill = statements
+            .iter()
+            .find(|statement| statement.starts_with("INSERT INTO other_db.mcp_event_locator"))
+            .expect("locator backfill");
+        let navigation_backfill = statements
+            .iter()
+            .find(|statement| statement.starts_with("INSERT INTO other_db.mcp_event_navigation"))
+            .expect("navigation backfill");
+        let search_source = statements
+            .iter()
+            .find(|statement| {
+                statement.starts_with("CREATE VIEW other_db.search_postings_source_031")
+            })
+            .expect("postings source view");
+        let search_rewrites = statements
+            .iter()
+            .filter(|statement| statement.starts_with("INSERT INTO other_db.search_postings"))
+            .collect::<Vec<_>>();
+        let file_attention_backfill = statements
+            .iter()
+            .find(|statement| {
+                statement.starts_with("INSERT INTO other_db.file_attention_project_roots")
+            })
+            .expect("file attention backfill");
+
+        assert!(search_source.contains("FROM other_db.events FINAL"));
+        assert!(locator_backfill.contains("FROM other_db.events FINAL"));
+        assert!(navigation_backfill.contains("FROM other_db.events FINAL"));
+        assert_eq!(search_rewrites.len(), 16);
+        for (bucket, rewrite) in search_rewrites.iter().enumerate() {
+            assert!(rewrite.contains(&format!(
+                "AND intDiv(cityHash64(d.session_id) % 64, 4) = {bucket}"
+            )));
+            assert!(rewrite.contains("max_bytes_before_external_group_by = 67108864"));
+            assert!(rewrite.contains("max_bytes_before_external_sort = 67108864"));
+            assert!(rewrite.contains("max_memory_usage = 1073741824"));
+            assert!(rewrite.contains("max_threads = 1"));
+            assert!(rewrite.contains("max_insert_threads = 1"));
+        }
+        for statement in [
+            locator_backfill,
+            navigation_backfill,
+            file_attention_backfill,
+        ] {
+            for setting in [
+                "max_block_size = 1024",
+                "preferred_max_column_in_block_size_bytes = 33554432",
+                "min_insert_block_size_rows = 0",
+                "min_insert_block_size_bytes = 0",
+                "max_insert_threads = 1",
+                "max_threads = 1",
+                "max_memory_usage = 1073741824",
+            ] {
+                assert!(
+                    statement.contains(setting),
+                    "031 backfill must bound payload-heavy reads with {setting}"
+                );
+            }
+        }
+        assert!(
+            !sql.contains("FROM other_db.events FINAL\n) AS d\nWHERE d.doc_len > 0"),
+            "031 must not keep the pre-bucketed full-corpus search_postings insert shape"
+        );
+        assert!(sql.contains("DROP VIEW IF EXISTS other_db.search_postings_source_031"));
+    }
+
+    #[test]
     fn migration_032_only_drops_the_empty_frozen_tool_source() {
         let migration = bundled_migrations()
             .into_iter()
